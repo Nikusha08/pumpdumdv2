@@ -3,6 +3,7 @@ strategy.py — Signal generation logic
 Combines all filters to produce SHORT reversal signals.
 """
 
+import math
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
@@ -35,29 +36,21 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 
 class Config:
-    # Pump filter
-    MIN_PUMP_PCT: float = 25.0          # minimum 24H pump to consider
+    MIN_PUMP_PCT: float        = 25.0
+    VOLUME_MULTIPLIER: float   = 3.0
+    RSI_OVERBOUGHT: float      = 75.0
+    RESISTANCE_TOLERANCE_PCT   = 3.0
+    MIN_FUNDING_RATE: float    = 0.0001    # 0.01%
+    MIN_SCORE: int             = 3
+    ATR_PERIOD: int            = 14
+    ATR_SL_MULT: float         = 2.0
+    ATR_TP1_MULT: float        = 2.0
+    ATR_TP2_MULT: float        = 4.0
 
-    # Volume
-    VOLUME_MULTIPLIER: float = 3.0      # last candle vs avg volume
-
-    # RSI
-    RSI_OVERBOUGHT: float = 75.0        # RSI threshold on 4H
-
-    # Resistance
-    RESISTANCE_TOLERANCE_PCT: float = 3.0  # price within X% of resistance
-
-    # Funding rate
-    MIN_FUNDING_RATE: float = 0.0005    # 0.05% — positive & high
-
-    # Score system — minimum score to emit signal
-    MIN_SCORE: int = 3                  # at least 3 filters must trigger
-
-    # Trade levels
-    ATR_PERIOD: int = 14
-    ATR_SL_MULT: float = 2.0
-    ATR_TP1_MULT: float = 2.0
-    ATR_TP2_MULT: float = 4.0
+    # Validation
+    MIN_ATR_PCT: float         = 0.003     # ATR >= 0.3% of price
+    MIN_CANDLES_FOR_RSI: int   = 20
+    MIN_PRICE: float           = 0.000001
 
 
 # ─────────────────────────────────────────────
@@ -85,92 +78,154 @@ class Signal:
 
 
 # ─────────────────────────────────────────────
+# VALIDATORS
+# ─────────────────────────────────────────────
+
+def _validate_dataframe(df: pd.DataFrame, symbol: str, min_len: int = 30) -> bool:
+    if df is None or len(df) < min_len:
+        logger.debug(f"{symbol}: not enough candles ({len(df) if df is not None else 0})")
+        return False
+    if df[["open", "high", "low", "close", "volume"]].isnull().any().any():
+        logger.debug(f"{symbol}: NaN in OHLCV")
+        return False
+    if (df["close"] <= 0).any():
+        logger.debug(f"{symbol}: zero/negative prices")
+        return False
+    return True
+
+
+def _validate_levels(entry: float, stop_loss: float, tp1: float, tp2: float, symbol: str) -> bool:
+    if any(v <= 0 for v in [entry, stop_loss, tp1, tp2]):
+        logger.debug(f"{symbol}: non-positive level")
+        return False
+    if stop_loss <= entry:
+        logger.debug(f"{symbol}: SL <= Entry (invalid short)")
+        return False
+    if tp1 >= entry or tp2 >= entry:
+        logger.debug(f"{symbol}: TP >= Entry (invalid short)")
+        return False
+    if tp2 >= tp1:
+        logger.debug(f"{symbol}: TP2 >= TP1")
+        return False
+    if (stop_loss - entry) / entry < 0.003:
+        logger.debug(f"{symbol}: SL distance < 0.3%")
+        return False
+    return True
+
+
+# ─────────────────────────────────────────────
 # MAIN SIGNAL GENERATOR
 # ─────────────────────────────────────────────
 
 def analyze_symbol(symbol: str, pump_pct: float) -> Optional[Signal]:
-    """
-    Full analysis pipeline for one symbol.
-    Returns Signal if all conditions are met, else None.
-    """
-    score = 0
-    reasons = []
 
-    # ── 1. PUMP FILTER ─────────────────────────────
+    # ── Quick pump check ───────────────────────────
     if pump_pct < Config.MIN_PUMP_PCT:
-        return None  # Quick exit — main precondition
-    score += 1
-    reasons.append(f"pump={pump_pct:.1f}%")
+        return None
 
-    # ── Fetch 4H data ──────────────────────────────
+    # ── Fetch 4H candles ───────────────────────────
     df_4h = get_klines(symbol, "4h", limit=100)
-    if df_4h is None or len(df_4h) < 20:
+    if not _validate_dataframe(df_4h, symbol, min_len=Config.MIN_CANDLES_FOR_RSI):
         return None
 
     current_price = float(df_4h["close"].iloc[-1])
+    if current_price < Config.MIN_PRICE:
+        return None
 
-    # ── 2. VOLUME SPIKE ────────────────────────────
+    # ── RSI — must be valid number ─────────────────
+    rsi = calc_rsi(df_4h["close"])
+    if math.isnan(rsi) or math.isinf(rsi):
+        logger.debug(f"{symbol}: RSI invalid ({rsi})")
+        return None
+
+    # ── ATR — must be meaningful ───────────────────
+    atr = calc_atr(df_4h, Config.ATR_PERIOD)
+    if math.isnan(atr) or math.isinf(atr) or atr <= 0:
+        logger.debug(f"{symbol}: ATR invalid ({atr})")
+        return None
+    if atr / current_price < Config.MIN_ATR_PCT:
+        logger.debug(f"{symbol}: ATR too small ({atr/current_price:.4%})")
+        return None
+
+    # ── Trade levels — validate before continuing ──
+    entry     = current_price
+    stop_loss = entry + Config.ATR_SL_MULT * atr
+    tp1       = entry - Config.ATR_TP1_MULT * atr
+    tp2       = entry - Config.ATR_TP2_MULT * atr
+
+    if not _validate_levels(entry, stop_loss, tp1, tp2, symbol):
+        return None
+
+    # ── Funding rate — must exist (= real futures) ─
+    funding = get_funding_rate(symbol)
+    if funding is None:
+        logger.debug(f"{symbol}: no funding rate — not a perp futures, skip")
+        return None
+
+    # ── Open Interest — must be real data ──────────
+    oi_df = get_open_interest_history(symbol, period="4h", limit=2)
+    if oi_df is None or float(oi_df["sumOpenInterestValue"].iloc[-1]) <= 0:
+        logger.debug(f"{symbol}: no OI data")
+        return None
+    oi_value = float(oi_df["sumOpenInterestValue"].iloc[-1])
+
+    # ── SCORE FILTERS ──────────────────────────────
+    score = 0
+    reasons = []
+
+    # 1. Pump ✅ (already passed)
+    score += 1
+    reasons.append(f"pump={pump_pct:.1f}%")
+
+    # 2. Volume spike
     vol_ratio = get_volume_ratio(df_4h)
     if is_volume_spike(df_4h, Config.VOLUME_MULTIPLIER):
         score += 1
-        reasons.append(f"vol_spike={vol_ratio:.1f}x")
+        reasons.append(f"vol={vol_ratio:.1f}x")
 
-    # ── 3. RSI OVERBOUGHT ──────────────────────────
-    rsi = calc_rsi(df_4h["close"])
+    # 3. RSI overbought
     if rsi >= Config.RSI_OVERBOUGHT:
         score += 1
         reasons.append(f"RSI={rsi:.1f}")
 
-    # ── 4. RESISTANCE LEVELS ───────────────────────
+    # 4. Near resistance (4H or 1D)
     res_4h = nearest_resistance(current_price, find_resistance_levels(df_4h))
-    near_res_4h = price_near_resistance(current_price, res_4h, Config.RESISTANCE_TOLERANCE_PCT)
+    near_4h = price_near_resistance(current_price, res_4h, Config.RESISTANCE_TOLERANCE_PCT)
 
     df_1d = get_klines(symbol, "1d", limit=60)
     res_1d = None
-    near_res_1d = False
-    if df_1d is not None and len(df_1d) >= 10:
+    near_1d = False
+    if df_1d is not None and _validate_dataframe(df_1d, symbol, min_len=10):
         res_1d = nearest_resistance(current_price, find_resistance_levels(df_1d))
-        near_res_1d = price_near_resistance(current_price, res_1d, Config.RESISTANCE_TOLERANCE_PCT)
+        near_1d = price_near_resistance(current_price, res_1d, Config.RESISTANCE_TOLERANCE_PCT)
 
-    if near_res_4h or near_res_1d:
+    if near_4h or near_1d:
         score += 1
-        reasons.append(f"near_resistance={'4H' if near_res_4h else '1D'}")
+        reasons.append(f"res={'4H' if near_4h else '1D'}")
 
-    # ── 5. FUNDING RATE ────────────────────────────
-    funding = get_funding_rate(symbol) or 0.0
+    # 5. Funding rate high & positive
     if funding >= Config.MIN_FUNDING_RATE:
         score += 1
         reasons.append(f"funding={funding:.4%}")
 
-    # ── 6. OI DIVERGENCE ───────────────────────────
+    # 6. OI divergence
     oi_div = is_oi_diverging(symbol)
     if oi_div:
         score += 1
-        reasons.append("OI_divergence")
+        reasons.append("OI_div")
 
-    # ── 7. LIQUIDITY SWEEP ─────────────────────────
+    # 7. Liquidity sweep
     liq_sweep = detect_liquidity_sweep(df_4h)
     if liq_sweep:
         score += 1
-        reasons.append("liq_sweep")
+        reasons.append("sweep")
 
-    # ── SCORE CHECK ────────────────────────────────
+    # ── Minimum score ──────────────────────────────
     if score < Config.MIN_SCORE:
-        logger.debug(f"{symbol}: score {score}/{Config.MIN_SCORE} — skip ({', '.join(reasons)})")
+        logger.debug(f"{symbol}: score {score} < {Config.MIN_SCORE} — [{', '.join(reasons)}]")
         return None
 
-    logger.info(f"{symbol}: SIGNAL score={score} [{', '.join(reasons)}]")
-
-    # ── TRADE LEVELS ───────────────────────────────
-    atr = calc_atr(df_4h, Config.ATR_PERIOD)
-    entry = current_price
-    stop_loss = entry + Config.ATR_SL_MULT * atr
-    tp1 = entry - Config.ATR_TP1_MULT * atr
-    tp2 = entry - Config.ATR_TP2_MULT * atr
-
-    # ── OPEN INTEREST SNAPSHOT ─────────────────────
-    oi_df = get_open_interest_history(symbol, period="4h", limit=2)
-    oi_value = float(oi_df["sumOpenInterestValue"].iloc[-1]) if oi_df is not None else 0.0
+    logger.info(f"✅ {symbol}: SIGNAL score={score}/7 [{', '.join(reasons)}]")
 
     return Signal(
         symbol=symbol,
