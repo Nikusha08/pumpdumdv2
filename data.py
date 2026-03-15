@@ -333,7 +333,8 @@ def is_oi_diverging(symbol: str) -> bool:
             return False
 
         price_chg = klines["close"].iloc[-1] / klines["close"].iloc[0] - 1
-        oi_chg    = oi_df["sumOpenInterest"].iloc[-1] / oi_df["sumOpenInterest"].iloc[0] - 1
+        # Use USDT value (not contract count) — more accurate for divergence
+        oi_chg    = oi_df["sumOpenInterestValue"].iloc[-1] / oi_df["sumOpenInterestValue"].iloc[0] - 1
 
         # Price up > 1%, OI down > 1%
         diverging = price_chg > 0.01 and oi_chg < -0.01
