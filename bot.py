@@ -54,7 +54,33 @@ TG_TOKEN        = os.environ.get("TG_TOKEN", "")
 TG_CHAT         = os.environ.get("TG_CHAT", "")
 SCAN_INTERVAL   = int(os.environ.get("SCAN_INTERVAL_SEC", "300"))
 SIGNALS_CSV     = Path("signals.csv")
-SIGNAL_COOLDOWN = 3600  # seconds between same symbol signals
+SIGNAL_COOLDOWN  = 3600
+COOLDOWN_FILE    = Path("cooldown.json")
+_signal_cache: dict[str, float] = {}
+
+
+def _load_cooldown():
+    """Load cooldown state from disk on startup."""
+    global _signal_cache
+    try:
+        if COOLDOWN_FILE.exists():
+            import json
+            data = json.loads(COOLDOWN_FILE.read_text())
+            now  = time.time()
+            # Only keep entries that are still within cooldown window
+            _signal_cache = {k: v for k, v in data.items() if now - v < SIGNAL_COOLDOWN}
+            logger.info(f"Cooldown loaded: {len(_signal_cache)} active symbols")
+    except Exception as e:
+        logger.warning(f"_load_cooldown: {e}")
+
+
+def _save_cooldown():
+    """Save cooldown state to disk."""
+    try:
+        import json
+        COOLDOWN_FILE.write_text(json.dumps(_signal_cache))
+    except Exception as e:
+        logger.warning(f"_save_cooldown: {e}")
 
 if os.environ.get("MIN_PUMP_PCT"):
     Config.MIN_PUMP_PCT = float(os.environ["MIN_PUMP_PCT"])
@@ -360,6 +386,7 @@ def is_on_cooldown(symbol: str) -> bool:
 
 def mark_signalled(symbol: str):
     _signal_cache[symbol] = time.time()
+    _save_cooldown()
 
 
 # ─────────────────────────────────────────────
@@ -472,27 +499,29 @@ def tg_reply_photo(chat_id: int, image_bytes: bytes, caption: str = ""):
 
 def _simulate_outcome(row: dict) -> str:
     """
-    Given a logged signal row, fetch forward candles and determine
-    whether TP1, TP2, or SL was hit first.
+    Fetch candles STARTING from signal date (historical).
+    Checks which level was hit first: SL, TP2, TP1.
     Returns: 'TP2', 'TP1', 'SL', or 'OPEN'
     """
     try:
-        symbol    = row["symbol"]
-        entry     = float(row["entry"])
-        sl        = float(row["stop_loss"])
-        tp1       = float(row["tp1"])
-        tp2       = float(row["tp2"])
-        sig_time  = pd.Timestamp(row["date"])
+        symbol   = row["symbol"]
+        sl       = float(row["stop_loss"])
+        tp1      = float(row["tp1"])
+        tp2      = float(row["tp2"])
+        sig_time = pd.Timestamp(row["date"])
 
-        # Fetch 4H candles from signal time onwards (next 30 candles = ~5 days)
-        from data import get_klines
+        # Pull historical 4H candles from signal date + 6 days forward
+        start_str = sig_time.strftime("%Y-%m-%d %H:%M:%S")
+        end_str   = (sig_time + pd.Timedelta(days=6)).strftime("%Y-%m-%d %H:%M:%S")
 
-        df = get_klines(symbol, "4h", limit=60)
+        from data import get_historical_klines
+        df = get_historical_klines(symbol, "4h", start_str=start_str, end_str=end_str)
+
         if df is None or df.empty:
             return "OPEN"
 
-        # Only look at candles AFTER the signal
-        future = df[df.index > sig_time].head(30)
+        # Skip first candle (that's the signal candle itself)
+        future = df.iloc[1:31]
         if future.empty:
             return "OPEN"
 
@@ -773,6 +802,9 @@ def main():
         return
 
     logger.info(f"Starting — interval={SCAN_INTERVAL}s, pump={Config.MIN_PUMP_PCT}%, score={Config.MIN_SCORE}/7")
+
+    # Restore cooldown state from previous session
+    _load_cooldown()
 
     # Start command polling in background thread
     t = threading.Thread(target=polling_loop, daemon=True)
