@@ -14,6 +14,7 @@ import csv
 import io
 import logging
 import os
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
+import pandas as pd
 import requests
 
 from data import get_futures_symbols, get_24h_change
@@ -418,6 +420,350 @@ def scan_market():
 # MAIN
 # ─────────────────────────────────────────────
 
+# ─────────────────────────────────────────────
+# TELEGRAM POLLING — listen for commands
+# ─────────────────────────────────────────────
+
+_last_update_id = 0
+
+
+def tg_get_updates(offset: int = 0) -> list:
+    """Long-poll Telegram for new messages."""
+    try:
+        url  = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates"
+        resp = requests.get(url, params={"offset": offset, "timeout": 20}, timeout=25)
+        resp.raise_for_status()
+        return resp.json().get("result", [])
+    except Exception as e:
+        logger.warning(f"tg_get_updates: {e}")
+        return []
+
+
+def tg_reply(chat_id: int, text: str):
+    """Send reply to a specific chat (not just the main channel)."""
+    try:
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        requests.post(url, json={
+            "chat_id":    chat_id,
+            "text":       text,
+            "parse_mode": "HTML",
+        }, timeout=10)
+    except Exception as e:
+        logger.warning(f"tg_reply: {e}")
+
+
+def tg_reply_photo(chat_id: int, image_bytes: bytes, caption: str = ""):
+    """Send photo reply to a specific chat."""
+    try:
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
+        requests.post(
+            url,
+            data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
+            files={"photo": ("chart.png", image_bytes, "image/png")},
+            timeout=15,
+        )
+    except Exception as e:
+        logger.warning(f"tg_reply_photo: {e}")
+
+
+# ─────────────────────────────────────────────
+# COMMAND HANDLERS
+# ─────────────────────────────────────────────
+
+def _simulate_outcome(row: dict) -> str:
+    """
+    Given a logged signal row, fetch forward candles and determine
+    whether TP1, TP2, or SL was hit first.
+    Returns: 'TP2', 'TP1', 'SL', or 'OPEN'
+    """
+    try:
+        symbol    = row["symbol"]
+        entry     = float(row["entry"])
+        sl        = float(row["stop_loss"])
+        tp1       = float(row["tp1"])
+        tp2       = float(row["tp2"])
+        sig_time  = pd.Timestamp(row["date"])
+
+        # Fetch 4H candles from signal time onwards (next 30 candles = ~5 days)
+        from data import get_klines
+
+        df = get_klines(symbol, "4h", limit=60)
+        if df is None or df.empty:
+            return "OPEN"
+
+        # Only look at candles AFTER the signal
+        future = df[df.index > sig_time].head(30)
+        if future.empty:
+            return "OPEN"
+
+        for _, candle in future.iterrows():
+            if candle["high"] >= sl:
+                return "SL"
+            if candle["low"] <= tp2:
+                return "TP2"
+            if candle["low"] <= tp1:
+                return "TP1"
+
+        return "OPEN"
+
+    except Exception as e:
+        logger.warning(f"_simulate_outcome: {e}")
+        return "OPEN"
+
+
+def _winrate_bar(winrate: float, width: int = 16) -> str:
+    """Generates a text progress bar for winrate."""
+    filled = round(winrate / 100 * width)
+    empty  = width - filled
+    bar    = "█" * filled + "░" * empty
+    return bar
+
+
+def _best_worst(trades: list[dict]) -> tuple[str, str]:
+    """Returns (best_trade_str, worst_trade_str)."""
+    winners = [t for t in trades if t["result"] in ("TP1", "TP2")]
+    losers  = [t for t in trades if t["result"] == "SL"]
+
+    best  = "—"
+    worst = "—"
+
+    if winners:
+        b = max(winners, key=lambda t: (2 if t["result"] == "TP2" else 1))
+        best = f"{b['symbol']} ({b['result']})"
+    if losers:
+        w = losers[-1]
+        worst = f"{w['symbol']} (SL)"
+
+    return best, worst
+
+
+def handle_backtest(chat_id: int, args: list[str]):
+    """
+    /backtest — анализирует все сигналы из signals.csv
+    Симулирует исходы (TP1/TP2/SL) и выдаёт итоговый отчёт.
+    """
+    tg_reply(chat_id, "⏳ <b>Считаю результаты...</b>\nАнализирую все сигналы из истории, подожди немного.")
+
+    try:
+        # ── Читаем signals.csv ─────────────────────
+        if not SIGNALS_CSV.exists():
+            tg_reply(chat_id, "⚠️ Файл signals.csv пустой — бот ещё не отправил ни одного сигнала.")
+            return
+
+        rows = []
+        with open(SIGNALS_CSV, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                rows.append(row)
+
+        if not rows:
+            tg_reply(chat_id, "⚠️ Сигналов в истории нет.")
+            return
+
+        total = len(rows)
+
+        # ── Симулируем исходы ──────────────────────
+        results = []
+        for row in rows:
+            outcome = _simulate_outcome(row)
+            results.append({**row, "result": outcome})
+            time.sleep(0.1)  # не спамим API
+
+        # ── Считаем статистику ─────────────────────
+        tp2_cnt  = sum(1 for r in results if r["result"] == "TP2")
+        tp1_cnt  = sum(1 for r in results if r["result"] == "TP1")
+        sl_cnt   = sum(1 for r in results if r["result"] == "SL")
+        open_cnt = sum(1 for r in results if r["result"] == "OPEN")
+
+        wins   = tp1_cnt + tp2_cnt
+        closed = wins + sl_cnt
+
+        winrate   = (wins / closed * 100) if closed > 0 else 0.0
+        bar       = _winrate_bar(winrate)
+
+        # P&L приближённый (TP ~+4%, SL ~-2% от ATR)
+        pnl_list = []
+        for r in results:
+            try:
+                entry = float(r["entry"])
+                sl    = float(r["stop_loss"])
+                tp1   = float(r["tp1"])
+                tp2   = float(r["tp2"])
+                risk  = abs(sl - entry)
+                if r["result"] == "TP2":
+                    pnl_list.append((entry - tp2) / entry * 100)
+                elif r["result"] == "TP1":
+                    pnl_list.append((entry - tp1) / entry * 100)
+                elif r["result"] == "SL":
+                    pnl_list.append(-risk / entry * 100)
+            except Exception:
+                pass
+
+        total_pnl = sum(pnl_list) if pnl_list else 0.0
+        avg_win   = sum(p for p in pnl_list if p > 0) / max(1, wins)
+        avg_loss  = sum(p for p in pnl_list if p < 0) / max(1, sl_cnt)
+        gross_win = sum(p for p in pnl_list if p > 0)
+        gross_los = abs(sum(p for p in pnl_list if p < 0))
+        pf        = gross_win / gross_los if gross_los > 0 else float("inf")
+        rr        = abs(avg_win / avg_loss) if avg_loss != 0 else 0.0
+
+        best, worst = _best_worst(results)
+
+        now_str = datetime.utcnow().strftime("%d.%m.%Y %H:%M UTC")
+
+        # ── Вердикт ────────────────────────────────
+        if winrate >= 55 and pf >= 1.5:
+            verdict = "🟢 Стратегия прибыльная"
+        elif winrate >= 45 and pf >= 1.0:
+            verdict = "🟡 Стратегия в плюсе"
+        else:
+            verdict = "🔴 Нужна донастройка"
+
+        # ── Форматируем отчёт ──────────────────────
+        msg = (
+            f"📊 <b>БЭКТЕСТ РЕЗУЛЬТАТЫ</b>\n"
+            f"🕐 {now_str}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"\n"
+            f"🏆 <b>WIN RATE</b>\n"
+            f"<code>{bar}</code>  <b>{winrate:.1f}%</b>\n"
+            f"\n"
+            f"🏅 TP2 закрыто:  <b>{tp2_cnt}</b>\n"
+            f"✅ TP1 закрыто:  <b>{tp1_cnt}</b>\n"
+            f"❌ SL сработало: <b>{sl_cnt}</b>\n"
+            f"⏱ Тайм-аут:     <b>{open_cnt}</b>\n"
+            f"📊 Всего:        <b>{total}</b>\n"
+            f"\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 <b>P&amp;L</b>\n"
+            f"📉 Итого P&amp;L:      <b>{total_pnl:+.2f}%</b>\n"
+            f"📈 Средний выигрыш: <b>+{avg_win:.2f}%</b>\n"
+            f"📉 Средний стоп:    <b>{avg_loss:.2f}%</b>\n"
+            f"⚖️ Risk/Reward:     <b>{rr:.2f}</b>\n"
+            f"📊 Profit Factor:   <b>{pf:.2f}</b>\n"
+            f"\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⭐️ <b>РЕКОРДЫ</b>\n"
+            f"🥇 Лучший:  {best}\n"
+            f"💀 Худший:  {worst}\n"
+            f"\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{verdict}"
+        )
+
+        tg_reply(chat_id, msg)
+
+    except Exception as e:
+        logger.error(f"handle_backtest: {e}", exc_info=True)
+        tg_reply(chat_id, f"❌ Ошибка: {e}")
+
+
+def handle_status(chat_id: int):
+    """/status — показывает текущие настройки бота и статистику сигналов."""
+    # Count signals from CSV
+    total_signals = 0
+    if SIGNALS_CSV.exists():
+        try:
+            with open(SIGNALS_CSV) as f:
+                total_signals = sum(1 for line in f) - 1  # minus header
+        except Exception:
+            pass
+
+    active_cooldowns = sum(
+        1 for sym, t in _signal_cache.items()
+        if time.time() - t < SIGNAL_COOLDOWN
+    )
+
+    tg_reply(chat_id,
+        f"🤖 <b>Bot Status</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚙️ Scan interval:  {SCAN_INTERVAL}s\n"
+        f"📈 Min pump:       {Config.MIN_PUMP_PCT}%\n"
+        f"⭐ Min score:      {Config.MIN_SCORE}/7\n"
+        f"📊 RSI threshold:  {Config.RSI_OVERBOUGHT}\n"
+        f"💰 Min funding:    {Config.MIN_FUNDING_RATE*100:.3f}%\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📬 Total signals:  {total_signals}\n"
+        f"⏳ On cooldown:    {active_cooldowns} symbols\n"
+        f"🕐 Time (UTC):     {datetime.utcnow().strftime('%H:%M:%S')}"
+    )
+
+
+def handle_help(chat_id: int):
+    """/help — список команд."""
+    tg_reply(chat_id,
+        "🤖 <b>Pump Reversal Bot — Команды</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "/backtest <code>SYMBOL</code> — бэктест монеты за 2024\n"
+        "  Пример: <code>/backtest PEPEUSDT</code>\n"
+        "  С датами: <code>/backtest BTCUSDT 2024-01-01 2024-06-01</code>\n\n"
+        "/status — настройки и статистика бота\n\n"
+        "/help — эта справка\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Сигналы приходят автоматически каждые 5 минут."
+    )
+
+
+def process_update(update: dict):
+    """Parse and route incoming Telegram update."""
+    try:
+        msg = update.get("message") or update.get("edited_message")
+        if not msg:
+            return
+
+        chat_id = msg["chat"]["id"]
+        text    = msg.get("text", "").strip()
+
+        if not text.startswith("/"):
+            return
+
+        parts   = text.split()
+        command = parts[0].lower().split("@")[0]  # handle /cmd@botname
+        args    = parts[1:]
+
+        logger.info(f"Command from {chat_id}: {command} {args}")
+
+        if command == "/backtest":
+            threading.Thread(
+                target=handle_backtest,
+                args=(chat_id, args),
+                daemon=True
+            ).start()
+        elif command == "/status":
+            handle_status(chat_id)
+        elif command == "/help" or command == "/start":
+            handle_help(chat_id)
+        else:
+            tg_reply(chat_id, "Неизвестная команда. Напиши /help")
+
+    except Exception as e:
+        logger.error(f"process_update: {e}", exc_info=True)
+
+
+# ─────────────────────────────────────────────
+# POLLING LOOP (runs in background thread)
+# ─────────────────────────────────────────────
+
+def polling_loop():
+    """Continuously poll Telegram for new commands."""
+    global _last_update_id
+    logger.info("Polling loop started")
+
+    while True:
+        try:
+            updates = tg_get_updates(offset=_last_update_id + 1)
+            for upd in updates:
+                _last_update_id = upd["update_id"]
+                process_update(upd)
+        except Exception as e:
+            logger.warning(f"polling_loop: {e}")
+            time.sleep(5)
+
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+
 def main():
     if not TG_TOKEN:
         logger.error("TG_TOKEN not set")
@@ -428,16 +774,25 @@ def main():
 
     logger.info(f"Starting — interval={SCAN_INTERVAL}s, pump={Config.MIN_PUMP_PCT}%, score={Config.MIN_SCORE}/7")
 
+    # Start command polling in background thread
+    t = threading.Thread(target=polling_loop, daemon=True)
+    t.start()
+
     tg_send_message(
         f"🤖 <b>Pump Reversal Bot — STARTED</b>\n"
         f"Scan interval: {SCAN_INTERVAL}s\n"
         f"Min pump: {Config.MIN_PUMP_PCT}%\n"
         f"Min score: {Config.MIN_SCORE}/7\n"
-        f"RSI threshold: {Config.RSI_OVERBOUGHT}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Waiting for signals..."
+        f"Команды:\n"
+        f"/backtest PEPEUSDT — бэктест\n"
+        f"/status — статус бота\n"
+        f"/help — справка\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Жду сигналов..."
     )
 
+    # Main scanner loop
     while True:
         try:
             scan_market()
