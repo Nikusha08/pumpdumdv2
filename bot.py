@@ -1,15 +1,13 @@
 """
 bot.py — Main entry point
-Telegram bot: market scanner, chart generator, signal sender, CSV logger.
+Telegram bot: scanner, chart generator, signal sender, CSV logger.
 
-Environment variables required:
-    TG_TOKEN  — Telegram bot token
-    TG_CHAT   — Telegram chat ID (int)
-
-Optional:
-    SCAN_INTERVAL_SEC — scan frequency in seconds (default: 300)
-    MIN_PUMP_PCT      — override minimum pump % (default: 25)
-    MIN_SCORE         — override minimum score (default: 3)
+Environment variables:
+    TG_TOKEN           — Telegram bot token
+    TG_CHAT            — Telegram chat ID
+    SCAN_INTERVAL_SEC  — scan frequency seconds (default: 300)
+    MIN_PUMP_PCT       — override pump threshold (default: 25)
+    MIN_SCORE          — override min score (default: 3)
 """
 
 import csv
@@ -22,14 +20,15 @@ from pathlib import Path
 from typing import Optional
 
 import matplotlib
-matplotlib.use("Agg")  # headless backend for server
-import matplotlib.dates as mdates
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import numpy as np
 import requests
 
 from data import get_futures_symbols, get_24h_change
 from strategy import analyze_symbol, Signal, Config
+from indicators import calc_rsi
 
 # ─────────────────────────────────────────────
 # LOGGING
@@ -49,48 +48,43 @@ logger = logging.getLogger("bot")
 # CONFIG
 # ─────────────────────────────────────────────
 
-TG_TOKEN = os.environ.get("TG_TOKEN", "")
-TG_CHAT = os.environ.get("TG_CHAT", "")
-SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL_SEC", "300"))
-SIGNALS_CSV = Path("signals.csv")
+TG_TOKEN        = os.environ.get("TG_TOKEN", "")
+TG_CHAT         = os.environ.get("TG_CHAT", "")
+SCAN_INTERVAL   = int(os.environ.get("SCAN_INTERVAL_SEC", "300"))
+SIGNALS_CSV     = Path("signals.csv")
+SIGNAL_COOLDOWN = 3600  # seconds between same symbol signals
 
-# Apply env overrides to strategy config
 if os.environ.get("MIN_PUMP_PCT"):
     Config.MIN_PUMP_PCT = float(os.environ["MIN_PUMP_PCT"])
 if os.environ.get("MIN_SCORE"):
     Config.MIN_SCORE = int(os.environ["MIN_SCORE"])
 
-# Cooldown: prevent repeated signals for same symbol (seconds)
-SIGNAL_COOLDOWN = 3600
 _signal_cache: dict[str, float] = {}
 
 
 # ─────────────────────────────────────────────
-# TELEGRAM API
+# TELEGRAM
 # ─────────────────────────────────────────────
 
 def tg_send_message(text: str) -> bool:
-    """Sends a text message to Telegram chat."""
     if not TG_TOKEN or not TG_CHAT:
-        logger.warning("TG_TOKEN or TG_CHAT not set — skipping Telegram send")
+        logger.warning("TG_TOKEN/TG_CHAT not set")
         return False
     try:
         url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        payload = {
+        resp = requests.post(url, json={
             "chat_id": TG_CHAT,
             "text": text,
             "parse_mode": "HTML",
-        }
-        resp = requests.post(url, json=payload, timeout=10)
+        }, timeout=10)
         resp.raise_for_status()
         return True
     except Exception as e:
-        logger.error(f"tg_send_message error: {e}")
+        logger.error(f"tg_send_message: {e}")
         return False
 
 
 def tg_send_photo(image_bytes: bytes, caption: str = "") -> bool:
-    """Sends a photo (bytes) to Telegram chat."""
     if not TG_TOKEN or not TG_CHAT:
         return False
     try:
@@ -104,7 +98,7 @@ def tg_send_photo(image_bytes: bytes, caption: str = "") -> bool:
         resp.raise_for_status()
         return True
     except Exception as e:
-        logger.error(f"tg_send_photo error: {e}")
+        logger.error(f"tg_send_photo: {e}")
         return False
 
 
@@ -112,119 +106,178 @@ def tg_send_photo(image_bytes: bytes, caption: str = "") -> bool:
 # CHART GENERATOR
 # ─────────────────────────────────────────────
 
+BG      = "#0d0d0d"
+GREEN   = "#00e676"
+RED     = "#ff1744"
+YELLOW  = "#ffd600"
+ORANGE  = "#ff9800"
+PURPLE  = "#e040fb"
+CYAN    = "#00e5ff"
+WHITE   = "#ffffff"
+GREY    = "#555555"
+
+
+def _price_fmt(price: float) -> str:
+    """Format price nicely regardless of magnitude."""
+    if price >= 1000:
+        return f"{price:,.2f}"
+    elif price >= 1:
+        return f"{price:.4f}"
+    elif price >= 0.01:
+        return f"{price:.5f}"
+    else:
+        return f"{price:.8f}"
+
+
 def generate_chart(signal: Signal) -> Optional[bytes]:
     """
-    Generates a dark-themed price chart with:
-    - Candlesticks (last 60 × 4H candles)
-    - Entry, SL, TP1, TP2 horizontal lines
-    - Resistance level
+    Generates a dark-themed chart with:
+    - Candlestick bars (last 60 × 4H candles)
+    - Entry / SL / TP1 / TP2 horizontal lines with labels
+    - Resistance levels
     - RSI subplot
+    - Volume bars
     """
     try:
         df = signal.df_4h.iloc[-60:].copy()
+        n  = len(df)
 
-        fig, (ax_price, ax_rsi) = plt.subplots(
-            2, 1, figsize=(14, 9), gridspec_kw={"height_ratios": [3, 1]},
-            facecolor="#0d0d0d"
-        )
+        if n < 10:
+            logger.warning(f"generate_chart: too few candles ({n})")
+            return None
 
-        for ax in [ax_price, ax_rsi]:
-            ax.set_facecolor("#0d0d0d")
+        # Validate all OHLCV values before drawing
+        if df[["open", "high", "low", "close", "volume"]].isnull().any().any():
+            logger.warning("generate_chart: NaN in candle data")
+            return None
+
+        # ── Layout ─────────────────────────────────
+        fig = plt.figure(figsize=(14, 10), facecolor=BG)
+        gs  = fig.add_gridspec(3, 1, height_ratios=[3, 0.8, 0.8], hspace=0.08)
+
+        ax_price  = fig.add_subplot(gs[0])
+        ax_vol    = fig.add_subplot(gs[1], sharex=ax_price)
+        ax_rsi    = fig.add_subplot(gs[2], sharex=ax_price)
+
+        for ax in [ax_price, ax_vol, ax_rsi]:
+            ax.set_facecolor(BG)
+            ax.tick_params(colors="#888", labelsize=8)
             for spine in ax.spines.values():
                 spine.set_edgecolor("#2a2a2a")
 
-        # ── Candlesticks ────────────────────────────
-        x = range(len(df))
-        x_labels = df.index
+        x = np.arange(n)
 
-        for i, (_, row) in enumerate(df.iterrows()):
-            color = "#00e676" if row["close"] >= row["open"] else "#ff1744"
-            ax_price.plot([i, i], [row["low"], row["high"]], color=color, linewidth=0.8)
-            height = abs(row["close"] - row["open"])
-            bottom = min(row["open"], row["close"])
-            rect = plt.Rectangle((i - 0.35, bottom), 0.7, height, color=color)
+        # ── Candlesticks ───────────────────────────
+        for i in range(n):
+            row   = df.iloc[i]
+            o, h, l, c = row["open"], row["high"], row["low"], row["close"]
+            color = GREEN if c >= o else RED
+
+            # Wick
+            ax_price.plot([i, i], [l, h], color=color, linewidth=0.8, zorder=2)
+
+            # Body
+            body_h = abs(c - o)
+            body_y = min(o, c)
+            if body_h < (h - l) * 0.01:  # doji — thin line
+                body_h = (h - l) * 0.015
+            rect = mpatches.Rectangle(
+                (i - 0.38, body_y), 0.76, body_h,
+                linewidth=0, facecolor=color, zorder=3
+            )
             ax_price.add_patch(rect)
 
-        n = len(df)
-
-        # ── Entry ──────────────────────────────────
-        ax_price.axhline(signal.entry, color="#ffffff", linewidth=1.5, linestyle="--", label=f"Entry {signal.entry:.4f}")
-
-        # ── Stop Loss ──────────────────────────────
-        ax_price.axhline(signal.stop_loss, color="#ff1744", linewidth=1.5, linestyle="--", label=f"SL {signal.stop_loss:.4f}")
-
-        # ── TP1 ────────────────────────────────────
-        ax_price.axhline(signal.tp1, color="#69f0ae", linewidth=1.2, linestyle=":", label=f"TP1 {signal.tp1:.4f}")
-
-        # ── TP2 ────────────────────────────────────
-        ax_price.axhline(signal.tp2, color="#00e676", linewidth=1.5, linestyle=":", label=f"TP2 {signal.tp2:.4f}")
-
-        # ── Resistance ─────────────────────────────
-        if signal.resistance_4h:
-            ax_price.axhline(
-                signal.resistance_4h, color="#ff9800",
-                linewidth=1.2, linestyle="-.", alpha=0.8,
-                label=f"Res 4H {signal.resistance_4h:.4f}"
-            )
-        if signal.resistance_1d:
-            ax_price.axhline(
-                signal.resistance_1d, color="#ff5722",
-                linewidth=1.2, linestyle="-.", alpha=0.8,
-                label=f"Res 1D {signal.resistance_1d:.4f}"
-            )
-
-        # ── TP zone shading ────────────────────────
-        ax_price.axhspan(signal.tp1, signal.tp2, alpha=0.05, color="#00e676")
-        ax_price.axhspan(signal.entry, signal.stop_loss, alpha=0.05, color="#ff1744")
-
-        # ── Labels ─────────────────────────────────
-        step = max(1, n // 8)
-        ax_price.set_xticks(list(x)[::step])
-        ax_price.set_xticklabels(
-            [x_labels[i].strftime("%m/%d %H:%M") for i in range(0, n, step)],
-            rotation=25, fontsize=7, color="#888"
-        )
-        ax_price.tick_params(axis="y", colors="#888")
-        ax_price.set_xlim(-1, n + 1)
-        ax_price.set_title(
-            f"⚡ SHORT SIGNAL — {signal.symbol}  |  Score: {signal.score}/7",
-            color="white", fontsize=13, fontweight="bold", pad=12
-        )
-        ax_price.set_ylabel("Price (USDT)", color="#888")
-
-        legend = ax_price.legend(
-            facecolor="#1a1a1a", labelcolor="white",
-            fontsize=8, loc="upper left", framealpha=0.8
-        )
-
-        # ── RSI subplot ────────────────────────────
-        from indicators import calc_rsi
-        rsi_values = [
-            calc_rsi(df["close"].iloc[max(0, i - 14): i + 1])
-            for i in range(len(df))
+        # ── Horizontal trade levels ─────────────────
+        levels = [
+            (signal.stop_loss, RED,    "--", f"SL  {_price_fmt(signal.stop_loss)}"),
+            (signal.entry,     WHITE,  "--", f"Entry  {_price_fmt(signal.entry)}"),
+            (signal.tp1,       GREEN,  ":",  f"TP1  {_price_fmt(signal.tp1)}"),
+            (signal.tp2,       "#00c853", ":", f"TP2  {_price_fmt(signal.tp2)}"),
         ]
-        ax_rsi.plot(x, rsi_values, color="#e040fb", linewidth=1.5)
-        ax_rsi.axhline(70, color="#ff1744", linewidth=0.8, linestyle="--", alpha=0.6)
-        ax_rsi.axhline(30, color="#00e676", linewidth=0.8, linestyle="--", alpha=0.6)
-        ax_rsi.axhline(75, color="#ff9800", linewidth=0.8, linestyle=":", alpha=0.5)
-        ax_rsi.fill_between(x, rsi_values, 70, where=[r > 70 for r in rsi_values], alpha=0.2, color="#ff1744")
+        if signal.resistance_4h:
+            levels.append((signal.resistance_4h, ORANGE, "-.", f"Res4H  {_price_fmt(signal.resistance_4h)}"))
+        if signal.resistance_1d:
+            levels.append((signal.resistance_1d, "#ff5722", "-.", f"Res1D  {_price_fmt(signal.resistance_1d)}"))
+
+        for price_level, color, ls, label in levels:
+            ax_price.axhline(price_level, color=color, linewidth=1.3,
+                             linestyle=ls, alpha=0.9, zorder=4)
+            ax_price.text(
+                n + 0.3, price_level, label,
+                color=color, fontsize=7.5, va="center",
+                fontweight="bold"
+            )
+
+        # ── Zone shading ────────────────────────────
+        ax_price.axhspan(signal.entry, signal.stop_loss, alpha=0.06, color=RED,   zorder=1)
+        ax_price.axhspan(signal.tp2,   signal.entry,     alpha=0.04, color=GREEN, zorder=1)
+
+        # ── Price axis limits ───────────────────────
+        all_prices = list(df["high"]) + list(df["low"]) + [signal.stop_loss, signal.tp2]
+        price_min  = min(all_prices) * 0.995
+        price_max  = max(all_prices) * 1.005
+        ax_price.set_ylim(price_min, price_max)
+        ax_price.set_xlim(-1, n + 8)  # right margin for labels
+        ax_price.set_ylabel("Price", color="#888", fontsize=9)
+        ax_price.yaxis.set_label_position("left")
+        ax_price.yaxis.tick_left()
+
+        # ── Title ───────────────────────────────────
+        ax_price.set_title(
+            f"SHORT SIGNAL  ·  {signal.symbol}  ·  Score {signal.score}/7  ·  Pump +{signal.pump_percent:.1f}%",
+            color=WHITE, fontsize=12, fontweight="bold", pad=10
+        )
+
+        # ── Volume bars ─────────────────────────────
+        vol_avg = df["volume"].mean()
+        for i in range(n):
+            row   = df.iloc[i]
+            color = GREEN if row["close"] >= row["open"] else RED
+            alpha = 0.9 if row["volume"] > vol_avg * 2.5 else 0.5
+            ax_vol.bar(i, row["volume"], color=color, alpha=alpha, width=0.76)
+
+        ax_vol.axhline(vol_avg, color=GREY, linewidth=0.8, linestyle="--")
+        ax_vol.set_ylabel("Vol", color="#888", fontsize=8)
+        ax_vol.set_yticks([])
+
+        # ── RSI line ────────────────────────────────
+        rsi_values = []
+        for i in range(n):
+            window = df["close"].iloc[max(0, i - 14): i + 1]
+            v = calc_rsi(window)
+            rsi_values.append(v if not (np.isnan(v) or np.isinf(v)) else 50.0)
+
+        ax_rsi.plot(x, rsi_values, color=PURPLE, linewidth=1.5, zorder=3)
+        ax_rsi.axhline(75, color=RED,   linewidth=0.8, linestyle="--", alpha=0.6)
+        ax_rsi.axhline(70, color=ORANGE, linewidth=0.6, linestyle=":",  alpha=0.5)
+        ax_rsi.axhline(30, color=GREEN,  linewidth=0.6, linestyle=":",  alpha=0.5)
+        ax_rsi.fill_between(x, rsi_values, 75,
+                            where=[v > 75 for v in rsi_values],
+                            alpha=0.2, color=RED, zorder=2)
         ax_rsi.set_ylim(0, 100)
-        ax_rsi.set_xlim(-1, n + 1)
-        ax_rsi.set_ylabel("RSI", color="#888", fontsize=9)
-        ax_rsi.tick_params(colors="#888", labelsize=7)
-        ax_rsi.set_facecolor("#0d0d0d")
-        ax_rsi.set_xticks([])
+        ax_rsi.set_ylabel("RSI", color="#888", fontsize=8)
+        ax_rsi.text(n + 0.3, signal.rsi, f"{signal.rsi:.0f}",
+                    color=PURPLE, fontsize=8, va="center", fontweight="bold")
 
-        plt.tight_layout(pad=1.5)
+        # ── X axis labels (shared) ──────────────────
+        step      = max(1, n // 8)
+        tick_pos  = list(range(0, n, step))
+        tick_labs = [df.index[i].strftime("%m/%d\n%H:%M") for i in tick_pos]
+        ax_rsi.set_xticks(tick_pos)
+        ax_rsi.set_xticklabels(tick_labs, color="#888", fontsize=7)
+        plt.setp(ax_price.get_xticklabels(), visible=False)
+        plt.setp(ax_vol.get_xticklabels(),   visible=False)
 
+        # ── Render ──────────────────────────────────
         buf = io.BytesIO()
-        plt.savefig(buf, format="png", dpi=150, bbox_inches="tight", facecolor="#0d0d0d")
+        plt.savefig(buf, format="png", dpi=150,
+                    bbox_inches="tight", facecolor=BG)
         plt.close()
         buf.seek(0)
         return buf.read()
 
     except Exception as e:
-        logger.error(f"generate_chart({signal.symbol}) error: {e}")
+        logger.error(f"generate_chart({signal.symbol}): {e}", exc_info=True)
         return None
 
 
@@ -233,36 +286,30 @@ def generate_chart(signal: Signal) -> Optional[bytes]:
 # ─────────────────────────────────────────────
 
 def format_signal_message(signal: Signal) -> str:
-    """Formats the Telegram signal message."""
-    oi_div_icon = "🔻" if signal.oi_divergence else "➖"
-    sweep_icon = "🔫" if signal.liquidity_sweep else "➖"
-
-    res_4h_str = f"{signal.resistance_4h:.4f}" if signal.resistance_4h else "—"
-    res_1d_str = f"{signal.resistance_1d:.4f}" if signal.resistance_1d else "—"
-
-    funding_pct = signal.funding_rate * 100
+    res_4h = _price_fmt(signal.resistance_4h) if signal.resistance_4h else "—"
+    res_1d = _price_fmt(signal.resistance_1d) if signal.resistance_1d else "—"
 
     return (
         f"⚡ <b>PUMP REVERSAL SIGNAL</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🪙 <b>Coin:</b> #{signal.symbol}\n"
-        f"📍 <b>Entry:</b> <code>{signal.entry:.4f}</code>\n"
-        f"🛑 <b>Stop Loss:</b> <code>{signal.stop_loss:.4f}</code>\n"
-        f"✅ <b>TP1:</b> <code>{signal.tp1:.4f}</code>\n"
-        f"🎯 <b>TP2:</b> <code>{signal.tp2:.4f}</code>\n"
+        f"📍 <b>Entry:</b> <code>{_price_fmt(signal.entry)}</code>\n"
+        f"🛑 <b>Stop Loss:</b> <code>{_price_fmt(signal.stop_loss)}</code>\n"
+        f"✅ <b>TP1:</b> <code>{_price_fmt(signal.tp1)}</code>\n"
+        f"🎯 <b>TP2:</b> <code>{_price_fmt(signal.tp2)}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📈 <b>Pump 24H:</b> +{signal.pump_percent:.1f}%\n"
         f"📊 <b>RSI (4H):</b> {signal.rsi:.1f}\n"
-        f"💰 <b>Funding Rate:</b> {funding_pct:.4f}%\n"
+        f"💰 <b>Funding:</b> {signal.funding_rate * 100:.4f}%\n"
         f"📦 <b>Open Interest:</b> ${signal.open_interest:,.0f}\n"
-        f"🔀 <b>Volume Ratio:</b> {signal.volume_ratio:.1f}x\n"
-        f"{oi_div_icon} <b>OI Divergence:</b> {'YES' if signal.oi_divergence else 'NO'}\n"
-        f"{sweep_icon} <b>Liquidity Sweep:</b> {'YES' if signal.liquidity_sweep else 'NO'}\n"
+        f"🔀 <b>Volume:</b> {signal.volume_ratio:.1f}x avg\n"
+        f"{'🔻' if signal.oi_divergence else '➖'} <b>OI Divergence:</b> {'YES' if signal.oi_divergence else 'NO'}\n"
+        f"{'🔫' if signal.liquidity_sweep else '➖'} <b>Liq Sweep:</b> {'YES' if signal.liquidity_sweep else 'NO'}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏔 <b>Resistance 4H:</b> <code>{res_4h_str}</code>\n"
-        f"🏔 <b>Resistance 1D:</b> <code>{res_1d_str}</code>\n"
+        f"🏔 <b>Res 4H:</b> <code>{res_4h}</code>\n"
+        f"🏔 <b>Res 1D:</b> <code>{res_1d}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"⭐ <b>Signal Score:</b> {signal.score}/7\n"
+        f"⭐ <b>Score:</b> {signal.score}/7\n"
         f"⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC"
     )
 
@@ -278,38 +325,35 @@ CSV_HEADERS = [
 
 
 def log_signal_to_csv(signal: Signal):
-    """Appends signal data to signals.csv for future backtesting."""
     file_exists = SIGNALS_CSV.exists()
     try:
         with open(SIGNALS_CSV, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+            w = csv.DictWriter(f, fieldnames=CSV_HEADERS)
             if not file_exists:
-                writer.writeheader()
-            writer.writerow({
-                "date": datetime.utcnow().isoformat(),
-                "symbol": signal.symbol,
-                "entry": round(signal.entry, 6),
-                "stop_loss": round(signal.stop_loss, 6),
-                "tp1": round(signal.tp1, 6),
-                "tp2": round(signal.tp2, 6),
-                "rsi": round(signal.rsi, 2),
-                "funding": round(signal.funding_rate, 6),
+                w.writeheader()
+            w.writerow({
+                "date":          datetime.utcnow().isoformat(),
+                "symbol":        signal.symbol,
+                "entry":         round(signal.entry, 8),
+                "stop_loss":     round(signal.stop_loss, 8),
+                "tp1":           round(signal.tp1, 8),
+                "tp2":           round(signal.tp2, 8),
+                "rsi":           round(signal.rsi, 2),
+                "funding":       round(signal.funding_rate, 6),
                 "open_interest": round(signal.open_interest, 2),
-                "pump_percent": round(signal.pump_percent, 2),
-                "score": signal.score,
+                "pump_percent":  round(signal.pump_percent, 2),
+                "score":         signal.score,
             })
     except Exception as e:
-        logger.error(f"log_signal_to_csv error: {e}")
+        logger.error(f"log_signal_to_csv: {e}")
 
 
 # ─────────────────────────────────────────────
-# COOLDOWN CHECK
+# COOLDOWN
 # ─────────────────────────────────────────────
 
 def is_on_cooldown(symbol: str) -> bool:
-    """Returns True if this symbol was recently signalled."""
-    last_time = _signal_cache.get(symbol, 0)
-    return (time.time() - last_time) < SIGNAL_COOLDOWN
+    return (time.time() - _signal_cache.get(symbol, 0)) < SIGNAL_COOLDOWN
 
 
 def mark_signalled(symbol: str):
@@ -321,126 +365,90 @@ def mark_signalled(symbol: str):
 # ─────────────────────────────────────────────
 
 def scan_market():
-    """
-    Full market scan cycle:
-    1. Get all symbols with min 24h volume
-    2. Filter by 24h pump %
-    3. Run full strategy analysis on pumped coins
-    4. Send signals to Telegram
-    """
-    logger.info("━━━ Starting market scan ━━━")
-    start_time = time.time()
+    logger.info("━━━ Starting scan ━━━")
+    t0 = time.time()
 
-    # Get candidate symbols (limit to top 250 by volume)
     symbols = get_futures_symbols(min_volume_usdt=5_000_000)[:250]
-    logger.info(f"Scanning {len(symbols)} symbols...")
+    logger.info(f"Scanning {len(symbols)} symbols")
 
-    pumped_symbols = []
-    for symbol in symbols:
-        pct = get_24h_change(symbol)
+    # Fast pre-filter: collect pumped coins
+    pumped = []
+    for sym in symbols:
+        pct = get_24h_change(sym)
         if pct is not None and pct >= Config.MIN_PUMP_PCT:
-            pumped_symbols.append((symbol, pct))
-        time.sleep(0.05)
+            pumped.append((sym, pct))
+        time.sleep(0.04)
 
-    logger.info(f"Pumped candidates (≥{Config.MIN_PUMP_PCT}%): {len(pumped_symbols)}")
+    pumped.sort(key=lambda x: x[1], reverse=True)
+    logger.info(f"Pumped ≥{Config.MIN_PUMP_PCT}%: {len(pumped)}")
 
-    # Sort by pump intensity (strongest first)
-    pumped_symbols.sort(key=lambda x: x[1], reverse=True)
-
-    signals_sent = 0
-    for symbol, pump_pct in pumped_symbols:
+    sent = 0
+    for symbol, pump_pct in pumped:
         if is_on_cooldown(symbol):
-            logger.debug(f"{symbol}: on cooldown, skip")
             continue
-
         try:
             signal = analyze_symbol(symbol, pump_pct)
             if signal is None:
                 continue
 
-            logger.info(f"🚨 SIGNAL: {symbol} (score={signal.score})")
+            logger.info(f"🚨 {symbol} score={signal.score}/7")
 
-            # Generate chart
-            chart_bytes = generate_chart(signal)
+            chart = generate_chart(signal)
+            msg   = format_signal_message(signal)
 
-            # Format message
-            msg = format_signal_message(signal)
-
-            # Send to Telegram
-            if chart_bytes:
-                tg_send_photo(chart_bytes, caption=msg)
+            if chart:
+                tg_send_photo(chart, caption=msg)
             else:
                 tg_send_message(msg)
 
-            # Log to CSV
             log_signal_to_csv(signal)
-
-            # Mark cooldown
             mark_signalled(symbol)
-            signals_sent += 1
-
-            time.sleep(1)  # Telegram rate limit buffer
+            sent += 1
+            time.sleep(1)
 
         except Exception as e:
-            logger.error(f"Error processing {symbol}: {e}", exc_info=True)
+            logger.error(f"{symbol}: {e}", exc_info=True)
         finally:
-            time.sleep(0.2)
+            time.sleep(0.15)
 
-    elapsed = time.time() - start_time
-    logger.info(f"━━━ Scan complete: {signals_sent} signals in {elapsed:.1f}s ━━━")
+    logger.info(f"━━━ Done: {sent} signals in {time.time()-t0:.1f}s ━━━")
 
 
 # ─────────────────────────────────────────────
-# STARTUP MESSAGE
+# MAIN
 # ─────────────────────────────────────────────
 
-def send_startup_message():
-    msg = (
-        "🤖 <b>Pump Reversal Bot — STARTED</b>\n"
+def main():
+    if not TG_TOKEN:
+        logger.error("TG_TOKEN not set")
+        return
+    if not TG_CHAT:
+        logger.error("TG_CHAT not set")
+        return
+
+    logger.info(f"Starting — interval={SCAN_INTERVAL}s, pump={Config.MIN_PUMP_PCT}%, score={Config.MIN_SCORE}/7")
+
+    tg_send_message(
+        f"🤖 <b>Pump Reversal Bot — STARTED</b>\n"
         f"Scan interval: {SCAN_INTERVAL}s\n"
         f"Min pump: {Config.MIN_PUMP_PCT}%\n"
         f"Min score: {Config.MIN_SCORE}/7\n"
         f"RSI threshold: {Config.RSI_OVERBOUGHT}\n"
-        f"Symbols: up to 250\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "Waiting for signals..."
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Waiting for signals..."
     )
-    tg_send_message(msg)
-
-
-# ─────────────────────────────────────────────
-# MAIN LOOP
-# ─────────────────────────────────────────────
-
-def main():
-    logger.info("=" * 50)
-    logger.info(" Pump Reversal Bot — Starting")
-    logger.info(f" Scan interval: {SCAN_INTERVAL}s")
-    logger.info(f" Min pump: {Config.MIN_PUMP_PCT}%")
-    logger.info(f" Min score: {Config.MIN_SCORE}/7")
-    logger.info("=" * 50)
-
-    if not TG_TOKEN:
-        logger.error("TG_TOKEN is not set. Set it in environment variables.")
-        return
-
-    if not TG_CHAT:
-        logger.error("TG_CHAT is not set. Set it in environment variables.")
-        return
-
-    send_startup_message()
 
     while True:
         try:
             scan_market()
         except KeyboardInterrupt:
-            logger.info("Bot stopped by user.")
+            logger.info("Stopped by user")
             break
         except Exception as e:
-            logger.error(f"Main loop error: {e}", exc_info=True)
-            time.sleep(30)  # brief pause before retry
+            logger.error(f"Main loop: {e}", exc_info=True)
+            time.sleep(30)
 
-        logger.info(f"Next scan in {SCAN_INTERVAL}s...")
+        logger.info(f"Next scan in {SCAN_INTERVAL}s")
         time.sleep(SCAN_INTERVAL)
 
 
