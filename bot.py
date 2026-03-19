@@ -54,7 +54,7 @@ TG_TOKEN        = os.environ.get("TG_TOKEN", "")
 TG_CHAT         = os.environ.get("TG_CHAT", "")
 SCAN_INTERVAL   = int(os.environ.get("SCAN_INTERVAL_SEC", "300"))
 SIGNALS_CSV     = Path("signals.csv")
-SIGNAL_COOLDOWN  = 3600
+SIGNAL_COOLDOWN  = 7200
 COOLDOWN_FILE    = Path("cooldown.json")
 _signal_cache: dict[str, float] = {}
 
@@ -217,10 +217,11 @@ def generate_chart(signal: Signal) -> Optional[bytes]:
 
         # ── Horizontal trade levels ─────────────────
         levels = [
-            (signal.stop_loss, RED,    "--", f"SL  {_price_fmt(signal.stop_loss)}"),
-            (signal.entry,     WHITE,  "--", f"Entry  {_price_fmt(signal.entry)}"),
-            (signal.tp1,       GREEN,  ":",  f"TP1  {_price_fmt(signal.tp1)}"),
-            (signal.tp2,       "#00c853", ":", f"TP2  {_price_fmt(signal.tp2)}"),
+            (signal.stop_loss, RED,       "--", f"SL  {_price_fmt(signal.stop_loss)}"),
+            (signal.entry,     WHITE,     "--", f"Entry  {_price_fmt(signal.entry)}"),
+            (signal.tp1,       GREEN,     ":",  f"TP1  {_price_fmt(signal.tp1)}"),
+            (signal.tp2,       "#00c853", ":",  f"TP2  {_price_fmt(signal.tp2)}"),
+            (signal.entry,     "#ffd600", ":",  f"BE (после TP1)"),
         ]
         if signal.resistance_4h:
             levels.append((signal.resistance_4h, ORANGE, "-.", f"Res4H  {_price_fmt(signal.resistance_4h)}"))
@@ -325,6 +326,7 @@ def format_signal_message(signal: Signal) -> str:
         f"🛑 <b>Stop Loss:</b> <code>{_price_fmt(signal.stop_loss)}</code>\n"
         f"✅ <b>TP1:</b> <code>{_price_fmt(signal.tp1)}</code>\n"
         f"🎯 <b>TP2:</b> <code>{_price_fmt(signal.tp2)}</code>\n"
+        f"⚠️ <b>При TP1 → стоп в безубыток</b> <code>{_price_fmt(signal.entry)}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📈 <b>Pump 24H:</b> +{signal.pump_percent:.1f}%\n"
         f"📊 <b>RSI (4H):</b> {signal.rsi:.1f}\n"
@@ -549,7 +551,7 @@ def _winrate_bar(winrate: float, width: int = 16) -> str:
 
 
 def _best_worst(trades: list[dict]) -> tuple[str, str]:
-    """Returns (best_trade_str, worst_trade_str)."""
+    """Returns (best_trade_str, worst_trade_str) with pnl %."""
     winners = [t for t in trades if t["result"] in ("TP1", "TP2")]
     losers  = [t for t in trades if t["result"] == "SL"]
 
@@ -557,11 +559,13 @@ def _best_worst(trades: list[dict]) -> tuple[str, str]:
     worst = "—"
 
     if winners:
-        b = max(winners, key=lambda t: (2 if t["result"] == "TP2" else 1))
-        best = f"{b['symbol']} ({b['result']})"
+        b = max(winners, key=lambda t: t.get("pnl", 0))
+        pnl = b.get("pnl", 0)
+        best = f"{b['symbol']} +{pnl:.1f}% ({b['result']})"
     if losers:
-        w = losers[-1]
-        worst = f"{w['symbol']} (SL)"
+        w = min(losers, key=lambda t: t.get("pnl", 0))
+        pnl = w.get("pnl", 0)
+        worst = f"{w['symbol']} {pnl:.1f}% (SL)"
 
     return best, worst
 
@@ -620,13 +624,17 @@ def handle_backtest(chat_id: int, args: list[str]):
                 tp2   = float(r["tp2"])
                 risk  = abs(sl - entry)
                 if r["result"] == "TP2":
-                    pnl_list.append((entry - tp2) / entry * 100)
+                    pnl = (entry - tp2) / entry * 100
                 elif r["result"] == "TP1":
-                    pnl_list.append((entry - tp1) / entry * 100)
+                    pnl = (entry - tp1) / entry * 100
                 elif r["result"] == "SL":
-                    pnl_list.append(-risk / entry * 100)
+                    pnl = -risk / entry * 100
+                else:
+                    pnl = 0.0
+                r["pnl"] = pnl
+                pnl_list.append(pnl)
             except Exception:
-                pass
+                r["pnl"] = 0.0
 
         total_pnl = sum(pnl_list) if pnl_list else 0.0
         avg_win   = sum(p for p in pnl_list if p > 0) / max(1, wins)
