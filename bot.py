@@ -512,9 +512,9 @@ def _simulate_outcome(row: dict) -> str:
         tp2      = float(row["tp2"])
         sig_time = pd.Timestamp(row["date"])
 
-        # Pull historical 4H candles from signal date + 6 days forward
+        # Pull historical 4H candles from signal date + 10 days forward
         start_str = sig_time.strftime("%Y-%m-%d %H:%M:%S")
-        end_str   = (sig_time + pd.Timedelta(days=6)).strftime("%Y-%m-%d %H:%M:%S")
+        end_str   = (sig_time + pd.Timedelta(days=10)).strftime("%Y-%m-%d %H:%M:%S")
 
         from data import get_historical_klines
         df = get_historical_klines(symbol, "4h", start_str=start_str, end_str=end_str)
@@ -522,18 +522,26 @@ def _simulate_outcome(row: dict) -> str:
         if df is None or df.empty:
             return "OPEN"
 
-        # Skip first candle (that's the signal candle itself)
-        future = df.iloc[1:31]
+        # Skip first candle (signal candle itself), check next 60 (~10 days)
+        future = df.iloc[1:61]
         if future.empty:
             return "OPEN"
 
         for _, candle in future.iterrows():
-            if candle["high"] >= sl:
-                return "SL"
-            if candle["low"] <= tp2:
+            high = candle["high"]
+            low  = candle["low"]
+
+            # If both TP and SL on same candle — TP wins (price went down first)
+            if low <= tp2 and high >= sl:
                 return "TP2"
-            if candle["low"] <= tp1:
+            if low <= tp2:
+                return "TP2"
+            if low <= tp1 and high >= sl:
                 return "TP1"
+            if low <= tp1:
+                return "TP1"
+            if high >= sl:
+                return "SL"
 
         return "OPEN"
 
@@ -606,15 +614,17 @@ def handle_backtest(chat_id: int, args: list[str]):
         tp2_cnt  = sum(1 for r in results if r["result"] == "TP2")
         tp1_cnt  = sum(1 for r in results if r["result"] == "TP1")
         sl_cnt   = sum(1 for r in results if r["result"] == "SL")
+        be_cnt   = sum(1 for r in results if r["result"] == "BE")
         open_cnt = sum(1 for r in results if r["result"] == "OPEN")
 
         wins   = tp1_cnt + tp2_cnt
-        closed = wins + sl_cnt
+        closed = wins + sl_cnt + be_cnt
 
-        winrate   = (wins / closed * 100) if closed > 0 else 0.0
-        bar       = _winrate_bar(winrate)
+        winrate = (wins / closed * 100) if closed > 0 else 0.0
+        bar     = _winrate_bar(winrate)
 
-        # P&L приближённый (TP ~+4%, SL ~-2% от ATR)
+        # P&L с учётом комиссии 0.08% на сделку
+        COMMISSION = 0.08
         pnl_list = []
         for r in results:
             try:
@@ -624,11 +634,13 @@ def handle_backtest(chat_id: int, args: list[str]):
                 tp2   = float(r["tp2"])
                 risk  = abs(sl - entry)
                 if r["result"] == "TP2":
-                    pnl = (entry - tp2) / entry * 100
+                    pnl = (entry - tp2) / entry * 100 - COMMISSION
                 elif r["result"] == "TP1":
-                    pnl = (entry - tp1) / entry * 100
+                    pnl = (entry - tp1) / entry * 100 - COMMISSION
                 elif r["result"] == "SL":
-                    pnl = -risk / entry * 100
+                    pnl = -risk / entry * 100 - COMMISSION
+                elif r["result"] == "BE":
+                    pnl = -COMMISSION  # вышли в ноль, только комиссия
                 else:
                     pnl = 0.0
                 r["pnl"] = pnl
@@ -668,6 +680,7 @@ def handle_backtest(chat_id: int, args: list[str]):
             f"🏅 TP2 закрыто:  <b>{tp2_cnt}</b>\n"
             f"✅ TP1 закрыто:  <b>{tp1_cnt}</b>\n"
             f"❌ SL сработало: <b>{sl_cnt}</b>\n"
+            f"🔄 Безубыток:    <b>{be_cnt}</b>\n"
             f"⏱ Тайм-аут:     <b>{open_cnt}</b>\n"
             f"📊 Всего:        <b>{total}</b>\n"
             f"\n"
