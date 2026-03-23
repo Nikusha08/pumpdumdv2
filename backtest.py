@@ -16,7 +16,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
-from data import get_historical_klines
+from data import get_historical_klines, get_funding_rate, is_oi_diverging
 from indicators import (
     calc_rsi,
     calc_atr,
@@ -32,6 +32,9 @@ from strategy import Config
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+# Commission per trade (entry + exit), taker fee 0.04% × 2
+COMMISSION_PCT = 0.08
+
 
 # ─────────────────────────────────────────────
 # RESULT DATA CLASS
@@ -46,7 +49,7 @@ class Trade:
     tp1: float
     tp2: float
     exit_price: float
-    result: str        # 'TP1', 'TP2', 'SL', 'OPEN'
+    result: str        # 'TP1', 'TP2', 'SL', 'BE', 'OPEN'
     pnl_pct: float
     rr: float          # risk:reward achieved
 
@@ -103,9 +106,22 @@ def run_backtest(
             continue
 
         # ── Filter 4: Resistance ────────────────────
-        levels = find_resistance_levels(window)
+        levels = find_resistance_levels(window, min_touches=2)
         resistance = nearest_resistance(current_price, levels)
         if not price_near_resistance(current_price, resistance, res_tol):
+            continue
+
+        # ── Filter 5: Funding rate (match live strategy) ──
+        funding = get_funding_rate(symbol)
+        if funding is None or funding < Config.MIN_FUNDING_RATE:
+            continue
+
+        # ── Filter 6: OI divergence ─────────────────
+        if not is_oi_diverging(symbol):
+            continue
+
+        # ── Filter 7: Liquidity sweep ───────────────
+        if not detect_liquidity_sweep(window):
             continue
 
         # ── Calculate trade levels ──────────────────
@@ -114,28 +130,49 @@ def run_backtest(
         sl = entry + sl_mult * atr
         tp1 = entry - tp1_mult * atr
         tp2 = entry - tp2_mult * atr
-        risk = sl - entry  # always positive (short)
+        risk = sl - entry
 
-        # ── Simulate forward: check if TP or SL hit ──
-        result = "OPEN"
+        # ── Simulate forward with BE after TP1 ──────
+        result     = "OPEN"
         exit_price = current_price
+        be_hit     = False
+        current_sl = sl  # sl moves to BE after TP1
 
-        future = df.iloc[i + 1: i + 25]  # next 24 candles (~4 days)
+        future = df.iloc[i + 1: i + 61]
         for _, fc in future.iterrows():
-            if fc["high"] >= sl:
-                result = "SL"
-                exit_price = sl
-                break
-            if fc["low"] <= tp2:
+            high = fc["high"]
+            low  = fc["low"]
+
+            # Move SL to breakeven after TP1 hit
+            if not be_hit and low <= tp1:
+                be_hit     = True
+                current_sl = entry  # breakeven
+
+            # Check exits with updated SL
+            if low <= tp2 and high >= current_sl:
                 result = "TP2"
                 exit_price = tp2
                 break
-            if fc["low"] <= tp1:
+            if low <= tp2:
+                result = "TP2"
+                exit_price = tp2
+                break
+            if not be_hit and low <= tp1 and high >= current_sl:
                 result = "TP1"
                 exit_price = tp1
                 break
+            if not be_hit and low <= tp1:
+                result = "TP1"
+                exit_price = tp1
+                break
+            if high >= current_sl:
+                result = "SL" if not be_hit else "BE"
+                exit_price = current_sl
+                break
 
-        pnl_pct = (entry - exit_price) / entry * 100  # short: profit when price drops
+        # ── PnL with commission ─────────────────────
+        raw_pnl = (entry - exit_price) / entry * 100
+        pnl_pct = raw_pnl - COMMISSION_PCT
         rr = (entry - exit_price) / risk if risk > 0 else 0
 
         trades.append(Trade(
@@ -168,7 +205,8 @@ def compute_metrics(trades: list[Trade]) -> dict:
         return {"total": len(trades), "closed": 0}
 
     winners = [t for t in closed if t.pnl_pct > 0]
-    losers = [t for t in closed if t.pnl_pct <= 0]
+    losers  = [t for t in closed if t.pnl_pct < 0]
+    # BE = breakeven, small loss due to commission only
 
     gross_profit = sum(t.pnl_pct for t in winners)
     gross_loss = abs(sum(t.pnl_pct for t in losers))
@@ -209,6 +247,7 @@ def print_metrics(metrics: dict, symbol: str):
     print(f"  Avg R:R achieved: {metrics.get('avg_rr', 0):.2f}")
     print(f"  Max drawdown:     {metrics.get('max_drawdown_pct', 0):.2f}%")
     print(f"  Total PnL:        {metrics.get('total_pnl_pct', 0):.2f}%")
+    print(f"  (incl. 0.08% commission per trade)")
     print("═" * 50 + "\n")
 
 
