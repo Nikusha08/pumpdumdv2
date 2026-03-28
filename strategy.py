@@ -68,6 +68,7 @@ class Config:
     # Validation gates
     MIN_ATR_PCT: float        = 0.003   # ATR must be >= 0.3% of price
     MIN_CANDLES: int          = 25      # minimum candles needed
+    MIN_OI_VALUE: float       = 15_000_000  # minimum OI $15M — filters junk coins
 
 
 # ─────────────────────────────────────────────
@@ -186,6 +187,9 @@ def analyze_symbol(symbol: str, pump_pct: float) -> Optional[Signal]:
     oi_value = float(oi_df["sumOpenInterestValue"].iloc[-1])
     if not math.isfinite(oi_value) or oi_value <= 0:
         logger.debug(f"{symbol}: OI value invalid ({oi_value})")
+        return None
+    if oi_value < Config.MIN_OI_VALUE:
+        logger.debug(f"{symbol}: OI too small (${oi_value:,.0f} < $15M) — skip")
         return None
 
     # ── SCORE SYSTEM ────────────────────────────────
