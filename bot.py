@@ -216,25 +216,44 @@ def generate_chart(signal: Signal) -> Optional[bytes]:
             ax_price.add_patch(rect)
 
         # ── Horizontal trade levels ─────────────────
-        levels = [
-            (signal.stop_loss, RED,       "--", f"SL  {_price_fmt(signal.stop_loss)}"),
-            (signal.entry,     WHITE,     "--", f"Entry  {_price_fmt(signal.entry)}"),
-            (signal.tp1,       GREEN,     ":",  f"TP1  {_price_fmt(signal.tp1)}"),
-            (signal.tp2,       "#00c853", ":",  f"TP2  {_price_fmt(signal.tp2)}"),
-            (signal.entry,     "#ffd600", ":",  f"BE (после TP1)"),
+        trade_levels = [
+            (signal.stop_loss, RED,       "--", 2.0, f"SL  {_price_fmt(signal.stop_loss)}"),
+            (signal.entry,     WHITE,     "--", 1.8, f"Entry  {_price_fmt(signal.entry)}"),
+            (signal.entry,     "#ffd600", ":",  1.2, f"BE  {_price_fmt(signal.entry)}"),
+            (signal.tp1,       GREEN,     ":",  1.5, f"TP1  {_price_fmt(signal.tp1)}"),
+            (signal.tp2,       "#00c853", ":",  2.0, f"TP2  {_price_fmt(signal.tp2)}"),
         ]
-        if signal.resistance_4h:
-            levels.append((signal.resistance_4h, ORANGE, "-.", f"Res4H  {_price_fmt(signal.resistance_4h)}"))
-        if signal.resistance_1d:
-            levels.append((signal.resistance_1d, "#ff5722", "-.", f"Res1D  {_price_fmt(signal.resistance_1d)}"))
 
-        for price_level, color, ls, label in levels:
-            ax_price.axhline(price_level, color=color, linewidth=1.3,
-                             linestyle=ls, alpha=0.9, zorder=4)
+        for price_level, color, ls, lw, label in trade_levels:
+            ax_price.axhline(price_level, color=color, linewidth=lw,
+                             linestyle=ls, alpha=0.95, zorder=4)
             ax_price.text(
                 n + 0.3, price_level, label,
-                color=color, fontsize=7.5, va="center",
-                fontweight="bold"
+                color=color, fontsize=7.5, va="center", fontweight="bold"
+            )
+
+        # ── Resistance zones (жирные, с зоной ±0.5%) ──
+        res_levels = []
+        if signal.resistance_4h:
+            res_levels.append((signal.resistance_4h, "#ff9800", "4H"))
+        if signal.resistance_1d:
+            res_levels.append((signal.resistance_1d, "#ff5722", "1D"))
+
+        for res_price, res_color, res_tf in res_levels:
+            # Зона ±0.5%
+            zone_h = res_price * 0.005
+            ax_price.axhspan(
+                res_price - zone_h, res_price + zone_h,
+                alpha=0.18, color=res_color, zorder=2
+            )
+            # Центральная линия
+            ax_price.axhline(res_price, color=res_color, linewidth=2.0,
+                             linestyle="-", alpha=0.9, zorder=5)
+            # Подпись с таймфреймом
+            ax_price.text(
+                n + 0.3, res_price,
+                f"Res {res_tf}  {_price_fmt(res_price)}",
+                color=res_color, fontsize=8, va="center", fontweight="bold"
             )
 
         # ── Zone shading ────────────────────────────
@@ -243,18 +262,25 @@ def generate_chart(signal: Signal) -> Optional[bytes]:
 
         # ── Price axis limits ───────────────────────
         all_prices = list(df["high"]) + list(df["low"]) + [signal.stop_loss, signal.tp2]
-        price_min  = min(all_prices) * 0.995
-        price_max  = max(all_prices) * 1.005
+        if signal.resistance_4h: all_prices.append(signal.resistance_4h)
+        if signal.resistance_1d: all_prices.append(signal.resistance_1d)
+        price_min  = min(all_prices) * 0.994
+        price_max  = max(all_prices) * 1.006
         ax_price.set_ylim(price_min, price_max)
-        ax_price.set_xlim(-1, n + 8)  # right margin for labels
-        ax_price.set_ylabel("Price", color="#888", fontsize=9)
-        ax_price.yaxis.set_label_position("left")
-        ax_price.yaxis.tick_left()
+        ax_price.set_xlim(-1, n + 10)
+        ax_price.set_ylabel("Price (USDT)", color="#888", fontsize=9)
 
-        # ── Title ───────────────────────────────────
+        # ── Title + таймфрейм ───────────────────────
         ax_price.set_title(
-            f"SHORT SIGNAL  ·  {signal.symbol}  ·  Score {signal.score}/7  ·  Pump +{signal.pump_percent:.1f}%",
+            f"SHORT SIGNAL  ·  {signal.symbol}  ·  4H Chart  ·  Score {signal.score}/7  ·  Pump +{signal.pump_percent:.1f}%",
             color=WHITE, fontsize=12, fontweight="bold", pad=10
+        )
+
+        # Таймфрейм в углу
+        ax_price.text(
+            0.01, 0.97, "4H", transform=ax_price.transAxes,
+            color="#888", fontsize=10, va="top", fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#1a1a1a", alpha=0.7)
         )
 
         # ── Volume bars ─────────────────────────────
@@ -502,17 +528,18 @@ def tg_reply_photo(chat_id: int, image_bytes: bytes, caption: str = ""):
 def _simulate_outcome(row: dict) -> str:
     """
     Fetch candles STARTING from signal date (historical).
-    Checks which level was hit first: SL, TP2, TP1.
-    Returns: 'TP2', 'TP1', 'SL', or 'OPEN'
+    Checks which level was hit first: SL, TP2, TP1, or BE.
+    After TP1 is hit — SL moves to entry (breakeven).
+    Returns: 'TP2', 'TP1', 'SL', 'BE', or 'OPEN'
     """
     try:
         symbol   = row["symbol"]
+        entry    = float(row["entry"])
         sl       = float(row["stop_loss"])
         tp1      = float(row["tp1"])
         tp2      = float(row["tp2"])
         sig_time = pd.Timestamp(row["date"])
 
-        # Pull historical 4H candles from signal date + 10 days forward
         start_str = sig_time.strftime("%Y-%m-%d %H:%M:%S")
         end_str   = (sig_time + pd.Timedelta(days=10)).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -522,26 +549,29 @@ def _simulate_outcome(row: dict) -> str:
         if df is None or df.empty:
             return "OPEN"
 
-        # Skip first candle (signal candle itself), check next 60 (~10 days)
         future = df.iloc[1:61]
         if future.empty:
             return "OPEN"
+
+        be_hit     = False
+        current_sl = sl  # SL moves to entry after TP1
 
         for _, candle in future.iterrows():
             high = candle["high"]
             low  = candle["low"]
 
-            # If both TP and SL on same candle — TP wins (price went down first)
-            if low <= tp2 and high >= sl:
-                return "TP2"
+            # TP1 hit — move SL to breakeven
+            if not be_hit and low <= tp1:
+                be_hit     = True
+                current_sl = entry  # breakeven
+
+            # Check TP2
             if low <= tp2:
                 return "TP2"
-            if low <= tp1 and high >= sl:
-                return "TP1"
-            if low <= tp1:
-                return "TP1"
-            if high >= sl:
-                return "SL"
+
+            # Check SL (or BE after TP1)
+            if high >= current_sl:
+                return "BE" if be_hit else "SL"
 
         return "OPEN"
 
