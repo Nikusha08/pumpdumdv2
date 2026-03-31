@@ -31,6 +31,7 @@ import requests
 from data import get_futures_symbols, get_24h_change
 from strategy import analyze_symbol, Signal, Config
 from indicators import calc_rsi
+from paper_trading import open_paper_trade, update_open_trades, get_paper_report, reset_paper_account
 
 # ─────────────────────────────────────────────
 # LOGGING
@@ -460,6 +461,12 @@ def scan_market():
 
             log_signal_to_csv(signal)
             mark_signalled(symbol)
+
+            # Открываем paper trade по этому сигналу
+            paper_trade = open_paper_trade(signal)
+            if paper_trade:
+                logger.info(f"Paper trade opened: {symbol} x{paper_trade['leverage']}")
+
             sent += 1
             time.sleep(1)
 
@@ -469,6 +476,19 @@ def scan_market():
             time.sleep(0.15)
 
     logger.info(f"━━━ Done: {sent} signals in {time.time()-t0:.1f}s ━━━")
+
+    # Обновляем открытые paper позиции текущими ценами
+    try:
+        current_prices = {}
+        for sym, pct in pumped:
+            from data import get_klines
+            df = get_klines(sym, "1h", limit=1)
+            if df is not None and not df.empty:
+                current_prices[sym] = float(df["close"].iloc[-1])
+        if current_prices:
+            update_open_trades(current_prices)
+    except Exception as e:
+        logger.warning(f"Paper update error: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -738,6 +758,24 @@ def handle_backtest(chat_id: int, args: list[str]):
         tg_reply(chat_id, f"❌ Ошибка: {e}")
 
 
+def handle_paper(chat_id: int, args: list[str]):
+    """
+    /paper — показывает статистику paper trading
+    /paper reset — сбросить счёт
+    """
+    if args and args[0].lower() == "reset":
+        reset_paper_account()
+        tg_reply(chat_id,
+            "🔄 <b>Paper Trading сброшен</b>\n"
+            f"Новый баланс: ${200:.2f}\n"
+            "Все сделки удалены."
+        )
+        return
+
+    report = get_paper_report()
+    tg_reply(chat_id, report)
+
+
 def handle_status(chat_id: int):
     """/status — показывает текущие настройки бота и статистику сигналов."""
     # Count signals from CSV
@@ -774,9 +812,9 @@ def handle_help(chat_id: int):
     tg_reply(chat_id,
         "🤖 <b>Pump Reversal Bot — Команды</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "/backtest <code>SYMBOL</code> — бэктест монеты за 2024\n"
-        "  Пример: <code>/backtest PEPEUSDT</code>\n"
-        "  С датами: <code>/backtest BTCUSDT 2024-01-01 2024-06-01</code>\n\n"
+        "/backtest — бэктест по всем сигналам\n\n"
+        "/paper — paper trading статистика\n"
+        "/paper reset — сбросить paper счёт\n\n"
         "/status — настройки и статистика бота\n\n"
         "/help — эта справка\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
@@ -811,6 +849,12 @@ def process_update(update: dict):
             ).start()
         elif command == "/status":
             handle_status(chat_id)
+        elif command == "/paper":
+            threading.Thread(
+                target=handle_paper,
+                args=(chat_id, args),
+                daemon=True
+            ).start()
         elif command == "/help" or command == "/start":
             handle_help(chat_id)
         else:
