@@ -68,7 +68,8 @@ class Config:
     # Validation gates
     MIN_ATR_PCT: float        = 0.003   # ATR must be >= 0.3% of price
     MIN_CANDLES: int          = 25      # minimum candles needed
-    MIN_OI_VALUE: float       = 1_500_000  # minimum OI $1.5M — filters junk coins
+    MIN_OI_VALUE: float       = 1_500_000  # minimum OI $1.5M
+    MAX_SL_PCT: float         = 10.0   # SL не дальше 10% от entry
 
 
 # ─────────────────────────────────────────────
@@ -163,9 +164,21 @@ def analyze_symbol(symbol: str, pump_pct: float) -> Optional[Signal]:
 
     # ── Gate 5: trade levels must be valid ─────────
     entry = price
-    sl    = entry + Config.ATR_SL_MULT  * atr
-    tp1   = entry - Config.ATR_TP1_MULT * atr
-    tp2   = entry - Config.ATR_TP2_MULT * atr
+
+    # SL = максимум из трёх: ATR, хай памп-свечи +1%, и уровень сопротивления
+    pump_candle_high = float(df_4h["high"].iloc[-1])
+    sl_atr           = entry + Config.ATR_SL_MULT * atr
+    sl_above_high    = pump_candle_high * 1.01   # на 1% выше хая памп-свечи
+    sl               = max(sl_atr, sl_above_high)
+
+    # Проверяем что SL не больше MAX_SL_PCT от entry
+    sl_pct = (sl - entry) / entry * 100
+    if sl_pct > Config.MAX_SL_PCT:
+        logger.debug(f"{symbol}: SL слишком далеко ({sl_pct:.1f}% > {Config.MAX_SL_PCT}%) — skip")
+        return None
+
+    tp1 = entry - Config.ATR_TP1_MULT * atr
+    tp2 = entry - Config.ATR_TP2_MULT * atr
 
     if not _ok_levels(entry, sl, tp1, tp2):
         logger.debug(f"{symbol}: invalid trade levels")
