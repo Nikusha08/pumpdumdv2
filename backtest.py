@@ -16,7 +16,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
-from data import get_historical_klines
+from data import get_historical_klines, get_funding_rate, is_oi_diverging
 from indicators import (
     calc_rsi,
     calc_atr,
@@ -111,14 +111,33 @@ def run_backtest(
         if not price_near_resistance(current_price, resistance, res_tol):
             continue
 
-        # ── Filter 5: Liquidity sweep ───────────────
+        # ── Filter 5: Funding rate (match live strategy) ──
+        funding = get_funding_rate(symbol)
+        if funding is None or funding < Config.MIN_FUNDING_RATE:
+            continue
+
+        # ── Filter 6: OI divergence ─────────────────
+        if not is_oi_diverging(symbol):
+            continue
+
+        # ── Filter 7: Liquidity sweep ───────────────
         if not detect_liquidity_sweep(window):
             continue
 
         # ── Calculate trade levels ──────────────────
         atr = calc_atr(window, atr_period)
         entry = current_price
-        sl = entry + sl_mult * atr
+
+        # SL выше хая памп-свечи и не дальше 8% от entry
+        pump_high     = float(window["high"].iloc[-1])
+        sl_atr        = entry + sl_mult * atr
+        sl_above_high = pump_high * 1.01
+        sl            = max(sl_atr, sl_above_high)
+
+        # Пропускаем если SL > 10% от entry
+        if (sl - entry) / entry > 0.10:
+            continue
+
         tp1 = entry - tp1_mult * atr
         tp2 = entry - tp2_mult * atr
         risk = sl - entry
